@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state — never commit
+sent-*.txt
+/tmp/
+*.log
+
+# Screenshots (may contain private chat content)
+*.png
+*.jpg
+
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/

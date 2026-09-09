@@ -197,6 +197,30 @@ if not ok:       # real failure → retry once, then exit non-zero
 
 ## Cron pipeline pattern
 
+**Rule zero: one GUI driver at a time.** If two pipelines drive WeChat
+concurrently, their clicks/pastes/Enters interleave on the same physical
+mouse+keyboard and messages land in the WRONG chat — with both pipelines
+logging success (real incident, 2026-09-09: a daily reminder was delivered
+to a 25-parent group because a digest pipeline held the row selection when
+the reminder's Enter fired). Every driver in this repo holds
+`scripts/wechat_gui_lock.py` — a global `flock` — for the entire send:
+
+```python
+from wechat_gui_lock import acquire_wechat_gui_lock, release_wechat_gui_lock
+lock_fd = acquire_wechat_gui_lock(timeout=300, reason="my-pipeline")
+try:
+    ...  # entire click/paste/Enter sequence
+finally:
+    release_wechat_gui_lock(lock_fd)
+
+# CLI form — wraps any command (for agent-driven flows without a script):
+#   python3 scripts/wechat_gui_lock.py with 300 photos-send -- bash send.sh
+```
+
+Stagger cron schedules too (the lock is the safety net; staggering avoids
+contention): e.g. 17:30 announcements, 17:45 newsletter, 20:00 digest,
+20:15 second reminder.
+
 `scripts/send_digest_to_wechat_v2.py` is the full production wrapper:
 
 - **Env-var handoff**: the upstream generator sets `$DIGEST_TEXT`; the mirror
@@ -256,6 +280,9 @@ these are the ones that cause silent failures and group-chat incidents:
 15. **A step isn't done until its side-effect is observed** (#34). "Clicked
     the coords" is not "picker opened". Verify each click's effect before
     proceeding.
+16. **Concurrent GUI drivers = wrong-chat delivery** (#69, real incident
+    2026-09-09). One physical mouse/keyboard means one driver. Use
+    `wechat_gui_lock.py` (Python or CLI form) and stagger cron minutes.
 
 ## Repository layout
 

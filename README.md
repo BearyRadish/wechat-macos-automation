@@ -241,6 +241,92 @@ contention): e.g. 17:30 announcements, 17:45 newsletter, 20:00 digest,
 DIGEST_TEXT="$(python3 generate_digest.py)" python3 scripts/send_digest_to_wechat_v2.py
 ```
 
+## Producer-outbox pattern (N→1 fan-in)
+
+The cron-staggering + GUI-lock recipe above covers **two** producers and
+**two** chats. Once you have N producers (school announcements, daily
+photos, weekly digest, specials reminders, PTSA notices…) writing to M
+group chats, the per-pipeline send code starts to drift and break in
+independent ways: same content gets sent twice (each pipeline tracks its
+own dedupe state), one pipeline downloads attachments while another
+silently degrades the same message to text-only, concurrent clickers
+interleave on the same physical mouse. Every major delivery failure in
+this kind of setup traces back to "I wrote a one-shot sender for this
+new pipeline."
+
+Fix: producers **never touch the WeChat GUI**. They write a JSON message
+to a queue dir; a single deterministic drain worker reads the queue under
+the global GUI lock, groups messages by recipient chat, and sends.
+
+```
+producers (cron/manual, no WeChat access, concurrent-safe)
+  enqueue → {to, type, dedupe_key, text, priority}
+     ▼
+<root>/queue/*.json          one file per message
+     ▼  ONE drain worker (cron, 1-2×/day)
+GUI lock → group by chat → select each chat ONCE
+→ paste+Return each message → archive (status+ts) → report
+```
+
+### Producer contract
+
+```python
+from wechat_outbox import enqueue
+
+enqueue(
+    to="<recipient_chat_key>",   # matches a row in recipients.json
+    type="<message_type>",       # "announcement" | "photos" | "digest" | ...
+    dedupe_key="<stable id>",    # source message id, or <date>-<type>
+    text=final_message,          # formatting done HERE, not at drain time
+)
+# "DEDUPED" return = success (idempotent re-runs are safe)
+```
+
+The producer computes its final message text — formatting, rotations,
+event windows, captions — at enqueue time. The drain only renders what
+it was handed. This keeps send code out of every pipeline.
+
+### Drain worker
+
+```bash
+python3 wechat_outbox.py drain [--dry-run]
+# groups by recipient, sends each group once, archives results to
+# <root>/archive/YYYY-MM/<msg-id>.json with status: sent | held | failed
+```
+
+The drain holds the same `wechat_gui_lock.py` lock the v2 wrapper uses,
+groups queued messages by chat, and selects each chat exactly once per
+run (sidebar row-click — search-select is deprecated). One physical
+mouse+keyboard → one drain → no interleaving.
+
+### Approval gate (new chats)
+
+When a new chat appears in the queue for the first time, the drain holds
+it (`held: chat not approved`) until a human explicitly approves via
+`approve <chat_key>`. The approval records consent, not proof the send
+path works — a chat can sit approved while the GUI recipe is still
+broken, and only a live-verified delivery (operator confirms arrival on
+their phone) closes the loop. **First-run on a group is not a smoke
+test.** Rehearse on your own File Transfer / a single-recipient DM
+provably distinct from your current sidebar selection.
+
+### Why this beats per-pipeline senders
+
+| Failure mode | Per-pipeline sender | Producer-outbox |
+|---|---|---|
+| Two pipelines send same source content | Each has its own dedupe state; duplicates leak | One global dedupe by `dedupe_key`; DEDUPED return |
+| Pipelines drift in send code | Each pipeline reimplements click/Enter; one downloads attachments while another degrades to text | One drain, one canonical send primitive; producers can't drift |
+| Producer cron overlaps drain | Crashes, interleaving, or focus battles | Drain holds GUI lock; producers run lock-free and concurrent-safe |
+| Adding a 5th producer | Copy-paste send code from a working pipeline | Add producer code that just calls `enqueue(...)`; no WeChat knowledge |
+
+### When NOT to use it
+
+- Single producer, single chat, one-off — the v2 wrapper is enough.
+- You need to react within seconds of an event (live chat support) —
+  cron-driven drain can't do sub-minute latency.
+- You can tolerate duplicates and have one pipeline forever — the
+  lock + stagger is simpler than operating a queue.
+
 ## Pitfall catalog (abridged — the 20 that bite hardest)
 
 Full catalog (68 entries) lives in the skill this repo was extracted from;

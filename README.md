@@ -221,6 +221,108 @@ Stagger cron schedules too (the lock is the safety net; staggering avoids
 contention): e.g. 17:30 announcements, 17:45 newsletter, 20:00 digest,
 20:15 second reminder.
 
+## Outbox + single-sender architecture
+
+When you have **multiple pipelines** that all need to send to WeChat
+(specials, daily announcements, photos, PTSA reminders, digests), driving
+the GUI from each one creates a coordination nightmare: each pipeline
+acquires the GUI lock, re-verifies the right chat, re-types its message,
+and risks colliding with Chrome focus or another concurrent driver. The
+fix — used in production since 2026-09-15 — is to **split producers
+from senders**:
+
+```
+  specials_calendar.py       ──┐
+  seesaw_announcements.py    ──┤
+  seesaw_photos_pipeline.py  ──┼─→  queue/ (JSON files)  ─→  drain  ─→  WeChat
+  ptsa_prep_reminder.py      ──┤                                  │
+  unified_digest.py          ──┘                                  ▼
+                                                          archive/ (sent log)
+```
+
+- **Producer** (no GUI): each pipeline runs at its own cron time, computes
+  its message text + attachments, and **writes a JSON file** to the outbox
+  queue directory (`~/workspace/wechat-outbox/queue/obx-<uuid>.json`). No
+  WeChat interaction. No GUI lock.
+- **Drain** (GUI): a single scheduled process holds the GUI lock, walks
+  the queue, picks each message's recipient from `recipients.json`,
+  verifies the right chat is open (post-select header gate), sends via
+  the file+text primitive, and **moves the JSON to `archive/`** with a
+  sent timestamp.
+
+The cron schedule that ships with this pattern:
+
+| Time | Job |
+|---|---|
+| 17:10 | 7 producers run Sun-Thu (specials, digest, PTSA, photos, announcements) |
+| 17:20 | Drain — picks up everything the producers just enqueued |
+| 17:30 | 5CS announcements cron (only if drain succeeded) |
+
+**Why drain BEFORE announcements?** Real incident 2026-09-16 — the
+announcements cron held Chrome focus at 17:35, the drain fired at 17:55,
+and WeChat would not come frontmost. Two days in a row. Moving the drain
+to 17:20 (before the 17:30 announcements cron) means the drain finishes
+and releases both the GUI lock and Chrome focus before any other pipeline
+tries to send.
+
+### Queue file shape
+
+```json
+{
+  "id": "obx-7b09ac9760f3",
+  "to": "5cs-rp",
+  "class": "5CS",
+  "type": "specials",
+  "dedupe_key": "specials:2026-10-08:5cs",
+  "text": "🟢 PE: Chloe, Jared, ...\n🩷 Music: ...\n...",
+  "files": [],
+  "priority": 2,
+  "enqueued_at": "2026-10-07T17:10:23+08:00",
+  "status": "pending"
+}
+```
+
+`type` selects routing (`specials`/`digest`/`ptsa`/`announcement`/`photo`).
+`dedupe_key` prevents re-enqueue within the same `(recipient, key)` tuple —
+the outbox dedupes on write, so a producer that runs twice in 60 s is safe.
+
+### Post-select chat header gate
+
+Before pasting anything, the drain re-reads the chat header (OCR of the
+top-right pane) and compares against `to`. If they don't match, **the
+message stays queued and the drain logs an error** — it never pastes into
+the wrong chat. This catches the "select-by-search misclicked" failure
+mode that previously sent 4 stale posters to a 25-parent group:
+
+```python
+def wechat_select_chat(search: str) -> bool:
+    """Cmd+F → paste search → Return; verify header before returning True."""
+    # ... keystrokes ...
+    header = _wechat_chat_header()  # OCR top-right
+    return _header_matches(search, header)  # token-overlap, lenient
+```
+
+When the gate refuses, the message is NOT lost — it remains in `queue/`
+and the next drain run retries it. This is fail-closed by design: a stuck
+queue is annoying, a wrong-chat paste is a 24-hour-old incident report.
+
+### Caveats
+
+- **Stale header OCR** — the chat header OCR occasionally includes chat
+  content noise (e.g. `5xx class chat (32) qrvr biv` — `qrvr biv` is
+  message text that leaked into the header crop). Use token-overlap
+  matching (`"file" in tokens or "transfer" in tokens`), not exact match.
+- **WeChat 4.1.60 Cmd+F changed behavior** — it now opens "Search Chat
+  History" (inside the current chat) instead of global chat search. To
+  switch chats, use direct row-click in the sidebar instead of Cmd+F
+  search. See Pitfall #70.
+- **Two-photo sends per post** — the photos pipeline produces ONE enqueue
+  per post, but the file+text primitive sends photo-bubble + text-companion
+  = TWO WeChat messages. Don't get confused by message-count audits.
+- **No 5CS sends after 21:00 CST** — even if the drain is still running.
+  Add a `--quiet-after-hours=21` flag if you need to schedule late-evening
+  work; better to defer to morning.
+
 `scripts/send_digest_to_wechat_v2.py` is the full production wrapper:
 
 - **Env-var handoff**: the upstream generator sets `$DIGEST_TEXT`; the mirror
@@ -369,6 +471,82 @@ these are the ones that cause silent failures and group-chat incidents:
 16. **Concurrent GUI drivers = wrong-chat delivery** (#69, real incident
     2026-09-09). One physical mouse/keyboard means one driver. Use
     `wechat_gui_lock.py` (Python or CLI form) and stagger cron minutes.
+17. **Drain ≠ real-time** (#70). A queued message waits for the next
+    drain. If the drain fails, the message stays queued — that's the
+    fail-closed design. Don't panic if a message is "late" by 30 minutes;
+    check the drain log + queue state, not WeChat directly.
+18. **Cmd+F in WeChat 4.1.60 opens Search Chat History, not Search Chats**
+    (#71). The keystroke sequence that switched chats reliably in 4.0.x
+    now opens a chat-internal search floater. To switch chats, **directly
+    click the row in the sidebar** at coordinates derived from the live
+    window geometry. The drain's post-select header gate catches the
+    wrong-chat paste if you don't fix this.
+19. **Header OCR includes chat content noise** (#72). The header crop
+    box at `(window_x, window_y, 200, 25)` overlaps the top of the chat
+    pane on small windows, capturing the first message bubble. Use
+    token-overlap matching (`any(t in header for t in search_tokens)`),
+    not exact string match.
+20. **Producers must not assume GUI state** (#73). A producer that runs
+    at 17:10 and writes a queue file has no idea what WeChat is doing.
+    It must NOT call any `wechat_*` GUI function. If it does, it competes
+    with the drain for the GUI lock and causes silent failures in both.
+21. **`screencapture -R x,y,w,h` captures the WRONG APP when another
+    window overlaps** (#79 — real incidents 2026-10-12, 10-14, 10-19,
+    10-25; 4 incidents, 30+ dropped messages). It grabs whatever is ON
+    TOP at those coordinates, NOT the window that owns them. When
+    Chrome or Feishu overlapped WeChat, the header OCR read the wrong
+    app's pixels and every send failed the post-select gate.
+    **Tell:** a header string that is obviously not a chat name
+    (contains `@`, `©`, `°`, `®`, or newline garbage).
+    **Fix:** the `wincap` helper — a Swift/ScreenCaptureKit tool that
+    captures the WeChat window's own content regardless of z-order.
+    ```bash
+    ./wincap WeChat /tmp/out.png                  # full window
+    ./wincap WeChat /tmp/out.png 230 5 561 50    # crop title band
+    ```
+    Build: `swiftc -O -o wincap scripts/wincap.swift`
+    **Swift gotchas:** (a) macOS 15 obsoleted
+    `CGWindowListCreateImage` — use
+    `SCScreenshotManager.captureImage(contentFilter:configuration:)`;
+    (b) `CGS_REQUIRE_INIT` aborts the process unless
+    `NSApplication.shared` is touched FIRST.
+22. **Suspect z-order before blaming focus or pickers** (#79
+    follow-on). A "chat select stuck" / "orphan file-picker"
+    diagnostic that repeats across every chat in one run is far more
+    likely to be a capture problem than a real stuck modal. Diagnose
+    by capturing the FULL screen (`screencapture -x` with no `-R`) and
+    looking at what is actually on top, or by running `wincap`.
+23. **Drain must bring WeChat frontmost BEFORE the first OCR read**
+    (#80). If another app is frontmost when the drain starts, the
+    first header read can capture the wrong app. Set WeChat frontmost
+    via System Events (`set frontmost of process "WeChat" to true`),
+    click the window body, and verify `frontmost of process
+    "WeChat"` is true before draining.
+24. **Post-select picker-leak guard caused false positives** (#81). A
+    guard comparing the pre-select header against the previous
+    select's header fires on EVERY chat transition (the headers are
+    equal by design before a switch happens). The post-select
+    header-match gate is sufficient on its own: if the OCR'd header
+    contains the search term, the select worked. Key any "did the
+    last switch work?" check on the SEARCH TERM, not on the prior
+    header string.
+
+## New helper: `wincap` (window capture, z-order-immune)
+
+```bash
+# Build (once)
+swiftc -O -o wincap scripts/wincap.swift
+
+# Capture the WeChat window regardless of what is on top
+./wincap WeChat /tmp/wechat.png
+
+# Capture just the chat-title band (window-relative points)
+./wincap WeChat /tmp/title.png 230 5 561 50
+```
+
+Use `wincap` for **any** diagnostic screenshot of the WeChat window on
+a machine with overlapping windows. `screencapture -R` is only safe
+when the WeChat window is known to be frontmost and unobstructed.
 
 ## Repository layout
 
@@ -380,10 +558,45 @@ scripts/
                                #   handoff, 24h dedup, WECHAT_MIRROR toggle
   verify_wechat_ready.sh       # preflight gate: 0 = ready, 1 = needs
                                #   intervention, 2 = WeChat not running
+  wechat_gui_lock.py           # global flock for one-driver-at-a-time
+                               #   (Python + CLI forms)
+  wechat_outbox.py             # outbox primitive: enqueue/drain for the
+                               #   producer/sender split. Adds:
+                               #   - queue/ + archive/ lifecycle
+                               #   - msg_type taxonomy (specials/digest/ptsa/
+                               #     announcement/photo)
+                               #   - wechat_send_file_and_text() primitive
+                               #   - post-select header gate (wincap-backed)
+  wincap.swift                 # ScreenCaptureKit window capture — grabs the
+                               #   WeChat window regardless of z-order, so the
+                               #   header OCR never reads an overlapping app
 references/
   coord-detection.md           # runtime window-geometry → click coords,
                                #   dock-icon AX probe, minimized-window recovery
+  outbox-pattern.md            # detailed producer/drain architecture,
+                               #   queue file schema, recipients.json format
 ```
+
+## See also
+
+- **Producers** that feed the outbox live in their respective repos:
+  - `seesaw-browser-control` — Seesaw announcements + photos pipelines
+  - `sas-school-reminder` — SAS calendar / specials / PTSA reminders
+  - `daily-digest` — unified weekly digest
+- **Drain** runs from a cron entry; example `jobs.json` snippet:
+
+```json
+{
+  "id": "outbox-drain-evening",
+  "name": "WeChat outbox drain (17:20)",
+  "schedule": {"kind": "cron", "expr": "20 17 * * 0-4"},
+  "command": "python3 scripts/wechat_outbox.py drain --max-per-chat 5 --max-total 30"
+}
+```
+
+Stagger drain runs at 07:50 + 17:20 with producer runs at 17:10 (Sun-Thu)
+and morning digest at 08:00. The 17:20 drain fires **before** the 17:30
+announcements cron — see "Why drain BEFORE announcements?" above.
 
 ## Legal & ethics
 
